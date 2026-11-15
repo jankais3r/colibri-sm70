@@ -1,0 +1,387 @@
+name: Build Colibri - AVX2 - CUDA 12 - sm_61 and sm_70
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # CPU target: AVX2 baseline, without requiring AVX-512.
+  # This also requires the other x86-64-v3 CPU features.
+  CPU_ARCH: x86-64-v3
+
+  # Native GPU code for Pascal sm_61 and Volta sm_70.
+  # No PTX fallback is included.
+  CUDA_GENCODE_LEGACY: >-
+    -gencode arch=compute_61,code=sm_61
+    -gencode arch=compute_70,code=sm_70
+
+jobs:
+  resolve-source:
+    name: Resolve latest official source
+    runs-on: ubuntu-24.04
+
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+
+    steps:
+      - name: Checkout official Colibri default branch
+        uses: actions/checkout@v4
+        with:
+          repository: JustVugg/colibri
+          path: colibri
+          persist-credentials: false
+
+      - name: Record source commit
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          commit="$(git -C colibri rev-parse HEAD)"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Official Colibri source"
+            echo
+            echo "- Repository: https://github.com/JustVugg/colibri"
+            echo "- Commit: \`$commit\`"
+            echo "- Linux and Windows will build this same commit."
+            echo "- CPU target: \`x86-64-v3\` (AVX2, no AVX-512 required)"
+            echo "- CUDA targets: \`sm_61\`, \`sm_70\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  linux:
+    name: Linux x86-64 AVX2
+    needs: resolve-source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout resolved official source
+        uses: actions/checkout@v4
+        with:
+          repository: JustVugg/colibri
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          path: colibri
+          persist-credentials: false
+
+      - name: Install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            python3
+
+      - name: Install CUDA 12.8.1
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc", "cudart-dev", "cuobjdump"]'
+          non-cuda-sub-packages: '["libcublas-dev"]'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build web dashboard
+        shell: bash
+        working-directory: colibri/web
+        run: |
+          set -euo pipefail
+
+          npm ci
+          npm run build
+          test -f dist/index.html
+
+      - name: Build AVX2 CUDA engines
+        shell: bash
+        working-directory: colibri
+        run: |
+          set -euo pipefail
+
+          echo "CPU target: $CPU_ARCH"
+          echo "CUDA_PATH=$CUDA_PATH"
+
+          "$CUDA_PATH/bin/nvcc" --version
+          "$CUDA_PATH/bin/cuobjdump" --version
+
+          # Clean first. The Makefile's configuration stamp does not
+          # record every individual CUDA_GENCODE value.
+          make -C c clean
+
+          make -C c -j2 \
+            colibri qwen36 kimi_k3 glm53 \
+            CUDA=1 \
+            "ARCH=$CPU_ARCH" \
+            CUDA_ARCH=sm_61 \
+            "CUDA_HOME=$CUDA_PATH" \
+            "CUDA_GENCODE=$CUDA_GENCODE_LEGACY"
+
+      - name: Verify embedded GPU architectures
+        shell: bash
+        working-directory: colibri
+        run: |
+          set -euo pipefail
+
+          for engine in colibri qwen36 kimi_k3 glm53; do
+            test -x "c/$engine"
+
+            echo "=== CUDA cubins in $engine ==="
+
+            "$CUDA_PATH/bin/cuobjdump" -lelf "c/$engine" \
+              | tee "$RUNNER_TEMP/${engine}-cubins.txt"
+
+            grep -q 'sm_61' "$RUNNER_TEMP/${engine}-cubins.txt"
+            grep -q 'sm_70' "$RUNNER_TEMP/${engine}-cubins.txt"
+          done
+
+          echo "Both requested GPU architectures were found."
+
+      - name: Package Linux build
+        shell: bash
+        working-directory: colibri
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve-source.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          stage="$RUNNER_TEMP/colibri-linux-stage"
+          mkdir -p "$stage"
+
+          # Include the exact tracked source associated with the binaries.
+          git archive HEAD | tar -x -C "$stage"
+
+          # Add generated dashboard and engines.
+          mkdir -p "$stage/web"
+          cp -a web/dist "$stage/web/dist"
+
+          cp \
+            c/colibri \
+            c/qwen36 \
+            c/kimi_k3 \
+            c/glm53 \
+            "$stage/c/"
+
+          {
+            echo "Platform: Linux x86-64"
+            echo "Official source: https://github.com/JustVugg/colibri"
+            echo "Source commit: $SOURCE_COMMIT"
+            echo "CPU target: $CPU_ARCH"
+            echo "CPU instruction baseline: AVX2; no AVX-512 required"
+            echo "CUDA toolkit requested: 12.8.1"
+            echo "GPU targets: sm_61 sm_70"
+            echo "PTX fallback: none"
+            echo "Engines: colibri qwen36 kimi_k3 glm53"
+            echo
+            echo "CUDA compiler:"
+            "$CUDA_PATH/bin/nvcc" --version
+            echo
+            echo "Host compiler:"
+            gcc --version | head -n 1
+          } > "$stage/BUILD-INFO.txt"
+
+          tar -C "$stage" -czf \
+            "$GITHUB_WORKSPACE/colibri-linux-avx2-cuda-sm61-sm70.tar.gz" \
+            .
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: colibri-linux-avx2-cuda-sm61-sm70
+          path: colibri-linux-avx2-cuda-sm61-sm70.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  windows:
+    name: Windows x86-64 AVX2
+    needs: resolve-source
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout resolved official source
+        uses: actions/checkout@v4
+        with:
+          repository: JustVugg/colibri
+          ref: ${{ needs.resolve-source.outputs.commit }}
+          path: colibri
+          persist-credentials: false
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: Install CUDA 12.8.1
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        with:
+          cuda: '12.8.1'
+          method: network
+          sub-packages: '["nvcc", "cudart", "cuobjdump"]'
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: UCRT64
+          update: false
+          path-type: inherit
+          install: >-
+            make
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build web dashboard
+        shell: bash
+        working-directory: colibri/web
+        run: |
+          set -euo pipefail
+
+          npm ci
+          npm run build
+          test -f dist/index.html
+
+      - name: Build CUDA DLL and AVX2 host engines
+        shell: msys2 {0}
+        working-directory: colibri
+        run: |
+          set -euo pipefail
+
+          echo "CPU target: $CPU_ARCH"
+
+          nvcc --version
+          cuobjdump --version
+          command -v cl
+          command -v gcc
+
+          cd c
+
+          # Clean before creating the DLL: make clean removes it.
+          make clean
+
+          # nvcc uses MSVC to build the shared CUDA backend.
+          make cuda-dll \
+            "ARCH=$CPU_ARCH" \
+            CUDA_ARCH=sm_61 \
+            "CUDA_GENCODE=$CUDA_GENCODE_LEGACY"
+
+          # MinGW builds the host engines with the AVX2 CPU baseline.
+          # The .exe target names are intentional.
+          make -j2 \
+            colibri.exe qwen36.exe kimi_k3.exe glm53.exe \
+            CUDA_DLL=1 \
+            "ARCH=$CPU_ARCH"
+
+          test -f coli_cuda.dll
+          test -f colibri.exe
+          test -f qwen36.exe
+          test -f kimi_k3.exe
+          test -f glm53.exe
+
+      - name: Verify embedded GPU architectures
+        shell: msys2 {0}
+        working-directory: colibri
+        run: |
+          set -euo pipefail
+
+          echo "=== CUDA cubins in coli_cuda.dll ==="
+
+          cuobjdump -lelf c/coli_cuda.dll \
+            | tee cuda-cubins.txt
+
+          grep -q 'sm_61' cuda-cubins.txt
+          grep -q 'sm_70' cuda-cubins.txt
+
+          echo "=== Imported DLLs ==="
+          objdump -p c/coli_cuda.dll | grep -i 'DLL Name:'
+
+          echo "Both requested GPU architectures were found."
+
+      - name: Copy CUDA runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $runtime = Join-Path $env:CUDA_PATH 'bin\cudart64_12.dll'
+
+          if (-not (Test-Path $runtime)) {
+            throw "CUDA runtime not found: $runtime"
+          }
+
+          Copy-Item $runtime 'colibri\c\cudart64_12.dll'
+
+      - name: Package Windows build
+        shell: msys2 {0}
+        working-directory: colibri
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve-source.outputs.commit }}
+        run: |
+          set -euo pipefail
+
+          # Convert runner paths for MSYS2 tools; 7z needs a Windows path.
+          temp_dir="$(cygpath -u "$RUNNER_TEMP")"
+          workspace="$(cygpath -u "$GITHUB_WORKSPACE")"
+
+          stage="$temp_dir/colibri-windows-stage"
+          archive="$workspace/colibri-windows-avx2-cuda-sm61-sm70.zip"
+
+          mkdir -p "$stage"
+
+          # Include the exact tracked source associated with the binaries.
+          git archive HEAD | tar -x -C "$stage"
+
+          # Add generated dashboard and engines.
+          mkdir -p "$stage/web"
+          cp -r web/dist "$stage/web/dist"
+
+          cp \
+            c/colibri.exe \
+            c/qwen36.exe \
+            c/kimi_k3.exe \
+            c/glm53.exe \
+            c/coli_cuda.dll \
+            c/cudart64_12.dll \
+            "$stage/c/"
+
+          {
+            echo "Platform: Windows x86-64"
+            echo "Official source: https://github.com/JustVugg/colibri"
+            echo "Source commit: $SOURCE_COMMIT"
+            echo "CPU target: $CPU_ARCH"
+            echo "CPU instruction baseline: AVX2; no AVX-512 required"
+            echo "CUDA toolkit requested: 12.8.1"
+            echo "GPU targets: sm_61 sm_70"
+            echo "PTX fallback: none"
+            echo "Engines: colibri.exe qwen36.exe kimi_k3.exe glm53.exe"
+            echo
+            echo "CUDA compiler:"
+            nvcc --version
+            echo
+            echo "Host compiler:"
+            gcc --version | head -n 1
+          } > "$stage/BUILD-INFO.txt"
+
+          cd "$stage"
+
+          archive_windows="$(cygpath -w "$archive")"
+          7z a "$archive_windows" .
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: colibri-windows-avx2-cuda-sm61-sm70
+          path: colibri-windows-avx2-cuda-sm61-sm70.zip
+          if-no-files-found: error
+          retention-days: 30
+
